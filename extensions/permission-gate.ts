@@ -365,8 +365,9 @@ const CLASSIFIER_TIMEOUT_MS = 90_000;
 const APPROVAL_STATE_FILENAME = "approval-queue.json";
 const MAX_CONSECUTIVE_DENIALS = 3;
 const MAX_TOTAL_DENIALS = 20;
-// These reasons always reach a human, even when the classifier says allow.
-const CRITICAL_REASONS = new Set(["sudo", "cloud or infrastructure change", "disk shred/wipe", "partition editor"]);
+// Fork policy: no matched reason forces a human on its own. The classifier's own
+// "risk" field decides; a human is asked only when it denies, says critical, or fails.
+const CRITICAL_REASONS = new Set<string>([]);
 const NO_RETRY_NOTICE =
 	"Do not retry this action in another form (rewording, splitting, scripts, or other tools). If the task needs it, tell the user why in plain text and wait.";
 
@@ -685,10 +686,6 @@ const hardDenyPatterns: DangerousPattern[] = [
 		pattern:
 			/\brm\b[^\n;&|]*[ \t]+["']?(?:--recursive|-[a-z]*r[a-z]*)["']?(?=[\s;&|]|$)[^\n;&|]*[ \t]+["']?(?!\/private\/tmp\/(?![^\s"';&|]*\.\.)[^\s"';&|])(?:\/|~|\$HOME|\$\{HOME\}|\/(?:Users|home|root|System|Applications|Library|etc|usr|var|bin|sbin|opt|private|Volumes))(?:["']?(?:\s|$)|\/)/i,
 	},
-	{
-		name: "unresolved recursive delete target",
-		pattern: /\brm\b(?=[^\n;&|]*[ \t]+["']?(?:--recursive|-[a-z]*r[a-z]*)["']?(?=[\s;&|]|$))(?=[^\n;&|]*(?:\$\(|\$\{|\$[A-Za-z_]|\$['"]|~[A-Za-z]|[`*?\[\]]|\{[^}]*,))[^\n;&|]*/i,
-	},
 	{ name: "filesystem format or signature wipe", pattern: /\b(?:mkfs(?:\.[a-z0-9_+-]+)?|wipefs)\b/i },
 	{ name: "disk device overwrite", pattern: /\bdd\b[^\n;&|]*\bof\s*=\s*["']?\/dev\//i },
 	{
@@ -702,10 +699,6 @@ const hardDenyPatterns: DangerousPattern[] = [
 	{
 		name: "forced push to a protected branch",
 		pattern: /\bgit\b[^\n;&|]*\bpush\b[^\n;&|]*\b(?:main|master|production|prod)\b[^\n;&|]*(?:--force(?:-with-lease)?|-[^\s;&|]*f[^\s;&|]*)\b/i,
-	},
-	{
-		name: "unresolved forced push target",
-		pattern: /\bgit\b(?=[^\n;&|]*\bpush\b)(?=[^\n;&|]*(?:--force(?:-with-lease)?|-[^\s;&|]*f[^\s;&|]*))(?=[^\n;&|]*(?:\$\(|\$\{|\$[A-Za-z_]|\$['"]|~[A-Za-z]|[`*?\[\]]|\{[^}]*,))[^\n;&|]*/i,
 	},
 ];
 
@@ -2643,34 +2636,49 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 		const userRule = evaluateUserCommandRules(command, ruleConfig);
 		const reasons = matchedReasons(command, ruleConfig, ctx.cwd);
 
-		if (hardReasons.length > 0) {
-			const rationale = `Non-negotiable safety rule matched: ${hardReasons.join(", ")}.`;
+		// Hard-deny and user-disallowed matches go to the human instead of being refused outright.
+		if (hardReasons.length > 0 || userRule?.decision === "deny") {
+			const matched = hardReasons.length > 0 ? hardReasons : ["user disallowed command"];
+			const rationale =
+				hardReasons.length > 0
+					? `Non-negotiable safety rule matched: ${hardReasons.join(", ")}.`
+					: `User disallowed command pattern matched: ${userRule?.pattern}.`;
+			const risk: ApprovalRisk = hardReasons.length > 0 ? "critical" : "medium";
+			const human = await askHuman(ctx, {
+				kind: "command",
+				command,
+				risk,
+				tldr: rationale,
+				recommendation: "deny",
+				reasons: unique([...reasons, ...matched]),
+			});
 			record(ctx, {
 				command: preview(command),
-				reasons: unique([...reasons, ...hardReasons]),
-				status: "blocked",
-				source: "hard-deny",
-				rationale,
-				risk: "critical",
+				reasons: unique([...reasons, ...matched]),
+				status: human.approved ? "approved" : "blocked",
+				source: "human",
+				rationale: human.unavailable
+					? `${rationale} No approver was reachable, so the command was blocked.`
+					: `${rationale} ${human.approved ? "You approved" : "You denied"} the command.`,
+				risk,
+				via: human.via,
 				timestamp: Date.now(),
 			});
+			if (human.approved) {
+				registerApproval();
+				return undefined;
+			}
 			const started = registerDenial(ctx);
-			return { block: true, reason: `${rationale} The command was blocked. ${NO_RETRY_NOTICE}${started ? " Every command now needs the user's approval." : ""}` };
-		}
-
-		if (userRule?.decision === "deny") {
-			const rationale = `User disallowed command pattern matched: ${userRule.pattern}.`;
-			record(ctx, {
-				command: preview(command),
-				reasons: ["user disallowed command"],
-				status: "blocked",
-				source: "user-rule",
-				rationale,
-				risk: "medium",
-				timestamp: Date.now(),
-			});
-			const started = registerDenial(ctx);
-			return { block: true, reason: `${rationale} The command was blocked. ${NO_RETRY_NOTICE}${started ? " Every command now needs the user's approval." : ""}` };
+			return {
+				block: true,
+				reason: denialMessage(
+					human.unavailable
+						? `no approver was reachable (${matched.join(", ")})`
+						: `the user did not approve this action (${matched.join(", ")})`,
+					human.note,
+					started,
+				),
+			};
 		}
 
 		if (autoModeEnabled && lockdown) {

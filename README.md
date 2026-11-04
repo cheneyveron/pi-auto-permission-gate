@@ -1,6 +1,17 @@
-# @nilskluewer/pi-auto-permission-gate
+# @nilskluewer/pi-auto-permission-gate (cheneyveron fork)
 
 A Pi extension that asks for confirmation before potentially destructive bash commands run.
+
+## Fork policy
+
+This fork trusts the classifier instead of keyword rules for the final call:
+
+- No matched reason forces a human on its own. `sudo`, cloud and infrastructure commands, `shred`, and partition editors go to the classifier like every other soft rule; a human is asked only when the classifier denies, reports `critical` risk, or fails.
+- Hard-deny rules are a short list of literal catastrophes (`rm -rf` on `/`, `~` or a system root, `mkfs`/`wipefs`, `dd of=/dev/...`, `diskutil erase`, a forced push to `main`/`master`/`prod`, and access to the approval queue). They ask the human instead of blocking outright, and still never call the model.
+- The `$variable`/glob heuristics (`unresolved recursive delete target`, `unresolved forced push target`) are gone. The classifier sees the whole command and decides.
+- User `disallowedCommands` matches also ask the human instead of blocking.
+
+Everything below is the upstream description, adjusted where this fork differs.
 
 The extension fails closed for matching commands when Pi has no user interface available.
 
@@ -14,8 +25,8 @@ It does not intercept Pi's direct `!` or `!!` shell commands, and it does not in
 | Order | Match | Result |
 | --- | --- | --- |
 | 1 | No built-in or user rule | Run |
-| 2 | Hard-deny rule | Block immediately, without the model or a prompt |
-| 3 | User `disallowedCommands` pattern | Block immediately |
+| 2 | Hard-deny rule | Ask the user without the model; blocked when no approver exists |
+| 3 | User `disallowedCommands` pattern | Ask the user; blocked when no approver exists |
 | 4 | User `allowedCommands` pattern | Run, unless a hard-deny rule matched |
 | 5 | Built-in soft rule with auto mode on | Ask the classifier |
 | 6 | Built-in soft rule with auto mode off | Ask the user in a UI, or block when no UI exists |
@@ -28,7 +39,7 @@ It does not intercept Pi's direct `!` or `!!` shell commands, and it does not in
 | Package installation, update, removal | `npm install`, `uv pip install`, `cargo add` | Allowed |
 | Scoped local deletion | `find build -type f -delete` | Allowed when explicit relative targets stay below the current working directory |
 | Recursive rm | `rm -rf build`, `rm -rf /tmp/x`, `rm -rf "$tmp"` after `tmp=$(mktemp -d)` | Always checked by the classifier, or by the user when auto mode is off. Allow patterns cannot skip this check |
-| Other deletion | `.git` deletion, parent paths, roots, broad `find . -delete`, `xargs rm` | Checked or hard-blocked |
+| Other deletion | `.git` deletion, parent paths, roots, broad `find . -delete`, `xargs rm` | Checked; literal system or home roots are hard-deny |
 | Package execution and publishing | `npm run`, `npm exec`, `npx`, `uvx`, `uv run python`, `npm publish` | Checked |
 | Privilege and permissions | `sudo`, `chmod 777`, recursive `chmod` or `chown` | Checked |
 | Filesystems and disks | `mkfs`, `wipefs`, `shred`, `diskutil`, `dd ... of=/dev/...` | Checked, with catastrophic cases hard-blocked |
@@ -54,7 +65,7 @@ Scoped `find -delete` is allowed by default when explicit relative targets stay 
 For example, `find build -type f -delete` passes without confirmation.
 Recursive `rm` is never allowed without a check: the classifier, or the user when auto mode is off, must approve every `rm -r` or `rm -rf`.
 Variables assigned once from `$(mktemp ...)` and `$TMPDIR` are not hard-blocked, so the classifier can approve temp-directory cleanup.
-Parent paths, filesystem roots, `.git` metadata, shell expansions, globs, and broad `find . -delete` remain protected.
+Literal filesystem roots stay hard-denied. Parent paths, `.git` metadata, shell expansions, globs, and broad `find . -delete` go to the classifier.
 - Package execution and publishing commands such as `npm run`, `npm publish`, and `npx`.
 - `sudo` and recursive `chmod` or `chown` commands.
 - World-writable permissions such as `chmod 777`.
@@ -82,7 +93,7 @@ A command that matches a pattern is shown to the user for review, but confirmati
 
 In interactive mode, the extension displays the matched reasons and a truncated command preview.
 The command runs only when the user explicitly selects `Yes`.
-Hard-deny operations are blocked before this confirmation flow, even when auto mode is off.
+Hard-deny operations ask the user before this confirmation flow, without the classifier, even when auto mode is off.
 
 In non-interactive, JSON, and print modes, matching commands are blocked because confirmation is unavailable.
 

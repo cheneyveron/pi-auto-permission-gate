@@ -334,7 +334,8 @@ test("rm recursion rules match option tokens, not paths or the next command", ()
     const command = `/bin/rm ${option} /`;
     assert.ok(hardDenyReasons(command).includes("recursive delete of a system or home root"), command);
     assert.ok(matchedReasons(command).includes("recursive/forced rm"), command);
-    assert.ok(hardDenyReasons(`rm ${option} "$unknown"`).includes("unresolved recursive delete target"));
+    // Unresolved targets are the classifier's call, not a hard deny.
+    assert.deepEqual(hardDenyReasons(`rm ${option} "$unknown"`), []);
     assert.ok(matchedReasons(`rm build ${option}; true`).includes("recursive/forced rm"));
   }
 });
@@ -367,7 +368,8 @@ test("recursive rm always needs the classifier", () => {
   ]) {
     assert.deepEqual(hardDenyReasons(command), [], command);
   }
-  // Reassignment, expansion tricks, globs, and escapes keep the hard deny.
+  // Fork policy: reassignment, expansion tricks, globs, and escapes are not hard-denied.
+  // The classifier sees the whole command and decides; only literal roots stay hard-denied.
   for (const command of [
     'tmp=$(mktemp -d); tmp=/; rm -rf "$tmp"',
     'tmp=$(mktemp -d); read tmp; rm -rf "$tmp"',
@@ -376,15 +378,16 @@ test("recursive rm always needs the classifier", () => {
     'tmp=$(mktemp -d); rm -rf "$tmp/../.."',
     'TMPDIR=/ rm -rf "$TMPDIR"',
     'dir=$(pwd); rm -rf "$dir"',
+    "rm -rf /{etc,usr}",
+    'rm -rf "$(printf /)"',
+    'BRANCH=main; git push -f origin "$BRANCH"',
   ]) {
-    assert.ok(hardDenyReasons(command).length > 0, command);
+    assert.deepEqual(hardDenyReasons(command), [], command);
+    assert.ok(matchedReasons(command).length > 0, command);
   }
   assert.ok(hardDenyReasons('rm -rf "${HOME}"').includes("recursive delete of a system or home root"));
-  assert.ok(hardDenyReasons("rm -rf /{etc,usr}").includes("unresolved recursive delete target"));
-  assert.ok(hardDenyReasons('rm -rf "$(printf /)"').includes("unresolved recursive delete target"));
   assert.ok(hardDenyReasons('dd if=/dev/zero of="/dev/disk2"').includes("disk device overwrite"));
   assert.ok(hardDenyReasons("git push origin main --force").includes("forced push to a protected branch"));
-  assert.ok(hardDenyReasons('BRANCH=main; git push -f origin "$BRANCH"').includes("unresolved forced push target"));
 });
 
 test("parses strict and fenced auto-mode decisions", () => {
@@ -434,14 +437,15 @@ test("edits allowed and disallowed command patterns from unified settings", asyn
     input: { command: "npm install evil-package" },
   });
   assert.equal(disallowed.block, true);
-  assert.equal(harness.decisionEntries().at(-1).data.source, "user-rule");
+  // Disallowed patterns and hard denies ask the human instead of refusing outright.
+  assert.equal(harness.decisionEntries().at(-1).data.source, "human");
 
   const hardDenied = await harness.invoke({
     toolName: "bash",
     input: { command: "rm -rf /" },
   });
   assert.equal(hardDenied.block, true);
-  assert.equal(harness.decisionEntries().at(-1).data.source, "hard-deny");
+  assert.equal(harness.decisionEntries().at(-1).data.source, "human");
   assert.equal(harness.classifierCalls.length, 0);
 });
 
@@ -528,18 +532,23 @@ test("allows a dangerous command when the user selects Yes", async () => {
   assert.equal(result, undefined);
 });
 
-test("hard-denies catastrophic commands without calling the model", async () => {
-  const harness = createHarness({ hasUI: true, choice: "Yes" });
+test("hard-deny rules reach the human without calling the model", async () => {
+  const approved = createHarness({ hasUI: true, choice: "Yes" });
+  assert.equal(
+    await approved.invoke({ toolName: "bash", input: { command: 'dd if=/dev/zero of="/dev/disk2"' } }),
+    undefined,
+  );
+  assert.equal(approved.classifierCalls.length, 0);
+  assert.equal(approved.decisionEntries()[0].data.source, "human");
+  assert.equal(approved.decisionEntries()[0].data.status, "approved");
+  assert.match(approved.decisionEntries()[0].data.rationale, /Non-negotiable safety rule/);
 
-  const result = await harness.invoke({
-    toolName: "bash",
-    input: { command: 'dd if=/dev/zero of="/dev/disk2"' },
-  });
-
+  const denied = createHarness({ hasUI: true, choice: "No" });
+  const result = await denied.invoke({ toolName: "bash", input: { command: 'dd if=/dev/zero of="/dev/disk2"' } });
   assert.equal(result.block, true);
-  assert.match(result.reason, /Non-negotiable safety rule/);
-  assert.equal(harness.classifierCalls.length, 0);
-  assert.equal(harness.decisionEntries()[0].data.source, "hard-deny");
+  assert.match(result.reason, /did not approve this action \(disk device overwrite\)/);
+  assert.equal(denied.classifierCalls.length, 0);
+  assert.equal(denied.decisionEntries()[0].data.source, "human");
 });
 
 test("injects persisted auto-mode preference notes into classifier prompts", async () => {
@@ -1743,23 +1752,16 @@ test("the terminal and the browser race, and the first answer cancels the other"
   assert.equal(browserSignal.aborted, true);
 });
 
-test("critical commands always reach a human, even when the classifier allows them", async () => {
-  const gcloud = createHarness({
-    hasUI: true,
-    terminalWaits: true,
-    fastPass: true,
-    globalModeState: autoState(),
-    classifierText: ALLOW,
-    approval: async () => ({ status: "approved" }),
-  });
-  await gcloud.startSession();
-  assert.equal(await run(gcloud, "gcloud run deploy api --region europe-west1"), undefined);
-  assert.equal(gcloud.approvalRequests.length, 1);
-  assert.equal(gcloud.approvalRequests[0].risk, "critical");
-  assert.equal(gcloud.approvalRequests[0].recommendation, "approve");
-  // Critical commands skip the fast pass.
-  assert.equal(gcloud.classifierCalls.length, 1);
-  assert.doesNotMatch(gcloud.classifierCalls[0].request.messages[0].content[0].text, /FAST PASS/);
+test("matched reasons never force a human; the classifier's own risk does", async () => {
+  // Fork policy: sudo and cloud commands run when the classifier allows them with a non-critical risk.
+  for (const command of ["gcloud run deploy api --region europe-west1", "sudo cat /var/log/syslog", "kubectl -n int exec pod -- cat /etc/hosts"]) {
+    const harness = createHarness({ hasUI: true, terminalWaits: true, fastPass: true, globalModeState: autoState(), classifierText: ALLOW });
+    await harness.startSession();
+    assert.equal(await run(harness, command), undefined, command);
+    assert.equal(harness.approvalRequests.length, 0, command);
+    assert.equal(harness.classifierCalls.length, 1, command);
+    assert.match(harness.classifierCalls[0].request.messages[0].content[0].text, /FAST PASS/);
+  }
 
   const classifierCritical = createHarness({
     hasUI: true,
@@ -1773,9 +1775,17 @@ test("critical commands always reach a human, even when the classifier allows th
   assert.equal(result?.block, true);
   assert.equal(classifierCritical.approvalRequests[0].risk, "critical");
 
+  // Without an approver, a classifier allow still runs; only a deny or a critical risk needs a human.
   const noApprover = createHarness({ hasUI: false, globalModeState: autoState(), classifierText: ALLOW });
   await noApprover.startSession();
-  assert.equal((await run(noApprover, "terraform apply -auto-approve")).block, true);
+  assert.equal(await run(noApprover, "terraform apply -auto-approve"), undefined);
+  const noApproverCritical = createHarness({
+    hasUI: false,
+    globalModeState: autoState(),
+    classifierText: '{"decision":"allow","risk":"critical","rationale":"Changes production infrastructure."}',
+  });
+  await noApproverCritical.startSession();
+  assert.equal((await run(noApproverCritical, "terraform apply -auto-approve")).block, true);
 });
 
 test("pushes and merges are not critical when the classifier allows them", async () => {
@@ -1868,7 +1878,7 @@ test("decisions are reported to the browser history, except browser answers the 
   await run(hard, "rm -rf /");
   assert.deepEqual(
     { status: hard.historyPosts[0].status, source: hard.historyPosts[0].source, risk: hard.historyPosts[0].risk },
-    { status: "denied", source: "hard-deny", risk: "critical" },
+    { status: "denied", source: "human", risk: "critical" },
   );
 
   const terminal = createHarness({ hasUI: true, choice: "Yes", globalModeState: autoState(), classifierText: DENY });
